@@ -2,10 +2,14 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -15,22 +19,112 @@ import (
 	"github.com/rossoctl/rossoctl-cli/internal/containers"
 )
 
-// Container ports the authbridge proxy image publishes. They are the image's
-// own fixed ports; each is published on an ephemeral host port, and the host
-// side is discovered with Inspect rather than assumed.
+// containerPorts are the ports the proxy image listens on inside the container,
+// read from the config the container is given. Each is published on an ephemeral
+// host port, and the host side is discovered with Inspect rather than assumed.
 //
-// TODO: derive these from the config's listener addresses instead of hardcoding
-// them — the reverse port from listener.reverse_proxy_addr and the forward proxy
-// port from listener.forward_proxy_addr. The image listens wherever those
-// addresses say, so a config naming other ports publishes the wrong ones: the
-// reverse port would be published on nothing, and the child would be pointed at
-// a forward proxy port nothing is on.
-const (
-	containerReversePort      = 8000
-	containerForwardProxyPort = 8081
-	containerAdminPort        = 9093
-	containerSessionAPIPort   = 9094
-)
+// A zero port means "not listening", and is not published: the config either
+// disabled that listener or left its role inactive, so publishing it would map a
+// host port to nothing.
+type containerPorts struct {
+	// reverse is where callers reach the hosted service, from
+	// listener.reverse_proxy_addr.
+	reverse int
+
+	// forward is the egress proxy the child's HTTP_PROXY points at, from
+	// listener.forward_proxy_addr. It is the one port whose absence is fatal.
+	forward int
+
+	// admin is the stats/config endpoint, from stats.address.
+	admin int
+
+	// sessionAPI is the session events endpoint, from listener.session_api_addr.
+	sessionAPI int
+}
+
+// publishList returns the ports to publish, skipping those not listening.
+func (p containerPorts) publishList() []int {
+	var ports []int
+	for _, n := range []int{p.reverse, p.forward, p.admin, p.sessionAPI} {
+		if n > 0 {
+			ports = append(ports, n)
+		}
+	}
+	return ports
+}
+
+// containerPortsFromConfig reads the ports the image will listen on out of cfg.
+//
+// The image binds whatever its config says, so these cannot be constants: a
+// config naming other ports would have the reverse port published on nothing and
+// the child pointed at a forward proxy port nothing is on. cfg must already have
+// been through config.ApplyPreset (startHost does this), which is what fills the
+// per-mode defaults — otherwise an omitted address reads as "not listening" when
+// the image will in fact bind the preset's port.
+//
+// An address that is set but unparseable is an error rather than a skip: it means
+// the operator asked for a listener that neither this nor the image can honor,
+// and a silently unpublished port becomes a connection refused much later.
+func containerPortsFromConfig(cfg *config.Config) (containerPorts, error) {
+	var p containerPorts
+
+	// Only an active role's listener is started by the image, so an address left
+	// over from an inactive role must not be published. This mirrors
+	// ApplyPreset, which likewise fills an address only for an active role.
+	roles := cfg.Listener.ActiveRoles()
+
+	for _, f := range []struct {
+		name   string
+		addr   string
+		active bool
+		out    *int
+	}{
+		{"listener.reverse_proxy_addr", cfg.Listener.ReverseProxyAddr, roles[config.RoleReverse], &p.reverse},
+		{"listener.forward_proxy_addr", cfg.Listener.ForwardProxyAddr, roles[config.RoleForward], &p.forward},
+		{"stats.address", cfg.Stats.StatsAddress, true, &p.admin},
+		{"listener.session_api_addr", cfg.Listener.SessionAPIAddr, true, &p.sessionAPI},
+	} {
+		if !f.active || f.addr == "" {
+			continue
+		}
+		port, err := listenPort(f.addr)
+		if err != nil {
+			return containerPorts{}, fmt.Errorf("%s %q: %w", f.name, f.addr, err)
+		}
+		*f.out = port
+	}
+
+	// Without a forward proxy there is nothing to point the child at, which is
+	// the whole purpose of hosting the pipeline. Caught here rather than after
+	// the container is running, where it costs a start and a stop to learn.
+	if p.forward == 0 {
+		return containerPorts{}, fmt.Errorf(
+			"listener.forward_proxy_addr names no port to publish; " +
+				"the hosted command has no proxy to use")
+	}
+	return p, nil
+}
+
+// listenPort extracts the port from a listen address ("host:port", ":port").
+//
+// Port 0 is rejected even though it is a legal listen address: it tells the
+// image's kernel to pick a port, which cannot be published because the number is
+// not known until the image has already bound it — and it is inside the
+// container, where Inspect reports only what was published.
+func listenPort(addr string) (int, error) {
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0, fmt.Errorf("not a host:port address: %w", err)
+	}
+	port, err := net.LookupPort("tcp", portStr)
+	if err != nil {
+		return 0, fmt.Errorf("invalid port %q", portStr)
+	}
+	if port == 0 {
+		return 0, fmt.Errorf("port 0 lets the container pick a port, which cannot be published")
+	}
+	return port, nil
+}
 
 // containerConfigPath is where the realized config is mounted inside the
 // container, and what the container's command points at with --config.
@@ -92,7 +186,15 @@ func startAuthbridgeContainer(cmd *cobra.Command, cfg *config.Config, cfgPath, i
 		})
 	}
 
-	pc, err := runProxyContainer(cmd, engine, cfg, cfgPath, image)
+	// Read the ports out of the config before starting anything: the image binds
+	// what its config says, and a bad address is cheaper to report now than as a
+	// container that starts and then cannot be reached.
+	ports, err := containerPortsFromConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	pc, err := runProxyContainer(cmd, engine, cfg, cfgPath, image, ports)
 	if err != nil {
 		return nil, err
 	}
@@ -105,26 +207,27 @@ func startAuthbridgeContainer(cmd *cobra.Command, cfg *config.Config, cfgPath, i
 	}
 
 	// Discover the ephemeral host ports the runtime assigned. The container
-	// publishes fixed ports; the host side is only knowable after the fact.
-	ports, err := engine.Inspect(cmd.Context(), pc.id)
+	// publishes the ports read from its config; the host side is only knowable
+	// after the fact.
+	bound, err := engine.Inspect(cmd.Context(), pc.id)
 	if err != nil {
 		return fail(fmt.Errorf("inspecting proxy container: %w", err))
 	}
 
-	proxyPort, ok := containers.HostPort(ports, containerForwardProxyPort)
+	proxyPort, ok := containers.HostPort(bound, ports.forward)
 	if !ok {
 		return fail(fmt.Errorf("proxy container published no host port for %d/tcp; "+
-			"does image %s expose the forward proxy there?", containerForwardProxyPort, image))
+			"does image %s listen on the forward proxy port its config names?", ports.forward, image))
 	}
 	proxyAddr := proxyURL(fmt.Sprintf("127.0.0.1:%d", proxyPort))
 
 	if verbose {
-		reportContainerPorts(errOut, ports)
+		reportContainerPorts(errOut, bound, ports)
 	}
 	// Printed unconditionally, like the in-process session API address: the
 	// operator needs the session API port to use the endpoint, and it is
 	// different on every run.
-	if p, ok := containers.HostPort(ports, containerSessionAPIPort); ok {
+	if p, ok := containers.HostPort(bound, ports.sessionAPI); ok {
 		fmt.Fprintf(errOut, "session API listening on 127.0.0.1:%d (in container %s)\n", p, shortID(pc.id))
 	}
 
@@ -157,11 +260,14 @@ func startAuthbridgeContainer(cmd *cobra.Command, cfg *config.Config, cfgPath, i
 // to generate one) and starts the container. On a start failure the temp
 // directory is removed before returning, so a failed attempt leaves nothing
 // behind.
+//
+// ports says which container ports to publish; see containerPortsFromConfig.
 func runProxyContainer(
 	cmd *cobra.Command,
 	engine containers.Engine,
 	cfg *config.Config,
 	cfgPath, image string,
+	ports containerPorts,
 ) (*proxyContainer, error) {
 	pc := &proxyContainer{engine: engine, cleanup: func() {}}
 
@@ -201,11 +307,20 @@ func runProxyContainer(
 		}
 	}
 
+	// Host entries are resolved before the start, so an unresolvable name in the
+	// config fails without leaving a container behind. pc.cleanup covers the temp
+	// CA directory the block above may have created.
+	hostEntries, err := proxyContainerHostEntries(cfg, cmd.ErrOrStderr())
+	if err != nil {
+		pc.cleanup()
+		return nil, err
+	}
+
 	id, err := engine.Start(cmd.Context(), containers.RunSpec{
 		Image:        image,
-		PublishPorts: []int{containerReversePort, containerForwardProxyPort, containerAdminPort, containerSessionAPIPort},
+		PublishPorts: ports.publishList(),
 		Mounts:       mounts,
-		HostEntries:  proxyContainerHostEntries(),
+		HostEntries:  hostEntries,
 		Args:         []string{"--config", containerConfigPath},
 	})
 	if err != nil {
@@ -221,23 +336,177 @@ func runProxyContainer(
 }
 
 // proxyContainerHostEntries returns the extra /etc/hosts entries the proxy
-// container needs.
+// container needs so the names in its config resolve the same way they do here.
 //
-// keycloak.localtest.me is mapped to the host because *.localtest.me resolves to
-// 127.0.0.1, which inside a container is the container itself — so a pipeline
-// configured against a Keycloak on this host (the jwt-validation and
-// token-exchange plugins both reach one) would otherwise try to connect to
-// itself and fail. host-gateway is the runtimes' portable name for the host.
+// A hostname in the config that resolves to loopback on this host means *this
+// host* — but inside the container loopback is the container, so the pipeline
+// would connect to itself and fail. Those names are mapped to host-gateway, the
+// literal both runtimes special-case for the host. The local demo's
+// keycloak.localtest.me is the motivating case (jwt-validation and
+// token-exchange both reach a Keycloak), but nothing here is specific to it.
 //
-// TODO: this is hardcoded to the local demo's Keycloak rather than derived from
-// the config, so a pipeline pointing at some other host-local name gets no entry,
-// and a --add-host is passed even when nothing needs it (harmless, but it is a
-// claim about the environment that may be false). The names are knowable: the
-// plugin configs carry keycloak_url and issuer.
-func proxyContainerHostEntries() []containers.HostEntry {
-	return []containers.HostEntry{
-		{Name: "keycloak.localtest.me", Address: containers.HostGateway},
+// Only loopback names are mapped. A hostname that resolves to a real address is
+// reachable from the container as-is, and redirecting it to the host would break
+// a pipeline pointed at a remote Keycloak.
+//
+// An unresolvable hostname is an error. It cannot be classified — and it is
+// almost certainly a typo or a missing /etc/hosts entry that would surface as a
+// container failing every token operation, which is far harder to read than this.
+func proxyContainerHostEntries(cfg *config.Config, errOut io.Writer) ([]containers.HostEntry, error) {
+	names := configHostnames(cfg)
+
+	entries := make([]containers.HostEntry, 0, len(names))
+	for _, name := range names {
+		loopback, err := resolvesToLoopback(name)
+		if err != nil {
+			return nil, fmt.Errorf("resolving %s from the pipeline config: %w "+
+				"(the proxy container needs it to resolve, since it reaches it by name)", name, err)
+		}
+		if !loopback {
+			// Reachable from the container as-is; an entry would only get in the way.
+			if verbose {
+				fmt.Fprintf(errOut, "container host entry: %s is not loopback, no mapping needed\n", name)
+			}
+			continue
+		}
+		entries = append(entries, containers.HostEntry{Name: name, Address: containers.HostGateway})
+		if verbose {
+			fmt.Fprintf(errOut, "container host entry: %s -> %s (loopback on this host)\n",
+				name, containers.HostGateway)
+		}
 	}
+	return entries, nil
+}
+
+// lookupIPAddr resolves a hostname to its addresses. It is a package variable so
+// tests can answer from a table instead of depending on the DNS of whatever
+// machine they run on.
+var lookupIPAddr = defaultLookupIPAddr
+
+// defaultLookupIPAddr is the real resolver, bounded by hostLookupTimeout.
+func defaultLookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error) {
+	return net.DefaultResolver.LookupIPAddr(ctx, host)
+}
+
+// hostLookupTimeout bounds a single hostname lookup. Generous for a local
+// resolver or /etc/hosts, while keeping an unreachable DNS server from hanging
+// the command before the container has even started.
+const hostLookupTimeout = 5 * time.Second
+
+// resolvesToLoopback reports whether name resolves to a loopback address on this
+// host.
+//
+// A name resolving to a mix of loopback and non-loopback addresses counts as
+// loopback: the container cannot reach the loopback half, which is the half a
+// local service is on.
+func resolvesToLoopback(name string) (bool, error) {
+	// An IP literal in the config is not a hostname and cannot be an /etc/hosts
+	// entry, so classify it directly rather than asking the resolver.
+	if ip := net.ParseIP(name); ip != nil {
+		return ip.IsLoopback(), nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), hostLookupTimeout)
+	defer cancel()
+
+	addrs, err := lookupIPAddr(ctx, name)
+	if err != nil {
+		return false, err
+	}
+	if len(addrs) == 0 {
+		return false, fmt.Errorf("no addresses")
+	}
+	for _, a := range addrs {
+		if a.IP.IsLoopback() {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// configHostnames returns the distinct hostnames the pipeline's plugins will
+// reach, in a stable order.
+//
+// Plugin config is json.RawMessage — opaque by design, since each plugin owns its
+// schema — so rather than knowing every plugin's fields, this walks the decoded
+// JSON and collects the host of anything that parses as an absolute URL. That
+// picks up keycloak_url and issuer without naming them, and any future plugin's
+// URL field for free.
+func configHostnames(cfg *config.Config) []string {
+	var names []string
+	seen := map[string]bool{}
+
+	for _, stage := range []config.PipelineStageConfig{cfg.Pipeline.Inbound, cfg.Pipeline.Outbound} {
+		for _, p := range stage.Plugins {
+			if len(p.Config) == 0 {
+				continue
+			}
+			var decoded any
+			if err := json.Unmarshal(p.Config, &decoded); err != nil {
+				// Not our error to report: the plugin's own Configure validates
+				// its config, and the container is what runs it.
+				continue
+			}
+			for _, h := range urlHosts(decoded) {
+				if !seen[h] {
+					seen[h] = true
+					names = append(names, h)
+				}
+			}
+		}
+	}
+	return names
+}
+
+// dialableSchemes are the URL schemes whose host is an endpoint the pipeline will
+// connect to.
+//
+// Restricted to these rather than accepting any scheme because not every URL-shaped
+// config value names something to dial. A SPIFFE ID like
+// spiffe://localtest.me/ns/team1/sa/weather-service is an identity to compare
+// against, and its "host" is a trust domain, not a server — the audience field in
+// the local weather demo is exactly this. Mapping a trust domain to host-gateway
+// would add a bogus /etc/hosts entry, and worse, an unreachable trust domain would
+// fail the whole command under the unresolvable-name rule.
+var dialableSchemes = map[string]bool{"http": true, "https": true}
+
+// urlHosts walks a decoded JSON value and returns the hostnames of every string
+// that is a URL the pipeline would dial, in encounter order.
+//
+// A host and a dialable scheme are both required. A bare string like "passthrough"
+// or a path is not a URL to anything, and url.Parse accepts both without complaint —
+// demanding a scheme and host is what keeps arbitrary config values out.
+func urlHosts(v any) []string {
+	switch t := v.(type) {
+	case string:
+		u, err := url.Parse(t)
+		if err != nil || !dialableSchemes[u.Scheme] || u.Hostname() == "" {
+			return nil
+		}
+		return []string{u.Hostname()}
+	case []any:
+		var out []string
+		for _, e := range t {
+			out = append(out, urlHosts(e)...)
+		}
+		return out
+	case map[string]any:
+		// Sorted for a deterministic entry order: Go randomizes map iteration,
+		// and the --add-host order would otherwise vary between runs, making the
+		// verbose output and the tests unstable.
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		var out []string
+		for _, k := range keys {
+			out = append(out, urlHosts(t[k])...)
+		}
+		return out
+	}
+	return nil
 }
 
 // stopAuthbridgeContainer stops and removes the container started by
@@ -331,19 +600,29 @@ func waitForCACert(ctx context.Context, caDir string, errOut io.Writer) (string,
 
 // reportContainerPorts prints the container's published port map, so an operator
 // can reach the admin and session endpoints on their ephemeral host ports.
-func reportContainerPorts(errOut io.Writer, ports map[string][]containers.PortBinding) {
+//
+// bound is what Inspect reported; want is what the config asked to publish, which
+// is what names each port. A port in want with no binding in bound is reported as
+// unpublished rather than omitted: that gap is the interesting case, since it
+// means the image did not listen where its config said.
+func reportContainerPorts(errOut io.Writer, bound map[string][]containers.PortBinding, want containerPorts) {
 	for _, p := range []struct {
 		port int
 		name string
 	}{
-		{containerReversePort, "reverse proxy"},
-		{containerForwardProxyPort, "forward proxy"},
-		{containerAdminPort, "admin"},
-		{containerSessionAPIPort, "session API"},
+		{want.reverse, "reverse proxy"},
+		{want.forward, "forward proxy"},
+		{want.admin, "admin"},
+		{want.sessionAPI, "session API"},
 	} {
-		if host, ok := containers.HostPort(ports, p.port); ok {
-			fmt.Fprintf(errOut, "container %s: %d -> 127.0.0.1:%d\n", p.name, p.port, host)
+		if p.port == 0 {
+			continue
 		}
+		if host, ok := containers.HostPort(bound, p.port); ok {
+			fmt.Fprintf(errOut, "container %s: %d -> 127.0.0.1:%d\n", p.name, p.port, host)
+			continue
+		}
+		fmt.Fprintf(errOut, "container %s: %d not published\n", p.name, p.port)
 	}
 }
 
