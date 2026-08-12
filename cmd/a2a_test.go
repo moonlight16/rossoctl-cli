@@ -3,6 +3,8 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"iter"
 	"math"
 	"net/http"
@@ -138,6 +140,64 @@ func TestA2ASendDefaultsToJSONRPC(t *testing.T) {
 	}
 	if !strings.Contains(out, "echo: hi") {
 		t.Errorf("default transport did not reach the agent:\n%s", out)
+	}
+}
+
+func TestA2ASendNegotiatesV03NonStreamingAgent(t *testing.T) {
+	var method string
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/.well-known/agent-card.json" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"name":"legacy","description":"test","url":%q,"version":"1","protocolVersion":"0.3.0","preferredTransport":"JSONRPC","capabilities":{"streaming":false},"defaultInputModes":["text"],"defaultOutputModes":["text"],"skills":[]}`, srv.URL)
+			return
+		}
+		var request struct {
+			ID     any    `json:"id"`
+			Method string `json:"method"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		method = request.Method
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      request.ID,
+			"result": map[string]any{
+				"id": "task-1", "contextId": "ctx-1", "kind": "task",
+				"status": map[string]any{"state": "completed"},
+				"artifacts": []any{map[string]any{
+					"artifactId": "art-1",
+					"parts":      []any{map[string]any{"kind": "text", "text": "legacy reply"}},
+				}},
+			},
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	out, err := execute(t, "a2a", "send", "--address", srv.URL, "--message", "hello")
+	if err != nil {
+		t.Fatalf("send: %v\noutput:\n%s", err, out)
+	}
+	if method != "message/send" {
+		t.Errorf("method = %q, want legacy message/send", method)
+	}
+	if !strings.Contains(out, "legacy reply") {
+		t.Errorf("output missing artifact content:\n%s", out)
+	}
+}
+
+func TestA2ASendRejectsEmptyErrorStream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"1","error":{"code":-32601,"message":"Method not found"}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	_, err := execute(t, "a2a", "send", "--address", srv.URL, "--message", "hello")
+	if err == nil || !strings.Contains(err.Error(), "no A2A events") {
+		t.Fatalf("error = %v, want empty-stream error", err)
 	}
 }
 

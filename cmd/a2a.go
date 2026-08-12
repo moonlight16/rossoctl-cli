@@ -14,6 +14,8 @@ import (
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
+	"github.com/a2aproject/a2a-go/v2/a2aclient/agentcard"
+	"github.com/a2aproject/a2a-go/v2/a2acompat/a2av0"
 )
 
 // a2aSendArgs holds the `a2a send` flags.
@@ -222,6 +224,7 @@ func streamA2AMessage(cmd *cobra.Command, opts a2aSendOptions) error {
 	}
 
 	var factoryOpts []a2aclient.FactoryOption
+	var bearerToken string
 	if opts.withAuthorization {
 		_, token, err := resolveServer()
 		if err != nil {
@@ -230,6 +233,7 @@ func streamA2AMessage(cmd *cobra.Command, opts a2aSendOptions) error {
 		if token == "" {
 			return fmt.Errorf("--with-authorization given but the current context has no bearer token; run `rossoctl login` to sign in")
 		}
+		bearerToken = token
 		factoryOpts = append(factoryOpts, a2aclient.WithCallInterceptors(&bearerInterceptor{token: token}))
 	}
 
@@ -257,11 +261,34 @@ func streamA2AMessage(cmd *cobra.Command, opts a2aSendOptions) error {
 				}
 				return a2aclient.NewRESTTransport(u, httpClient), nil
 			})),
+		a2av0.WithJSONRPCTransport(a2av0.JSONRPCTransportConfig{Client: httpClient}),
+		a2av0.WithRESTTransport(a2av0.RESTTransportConfig{Client: httpClient}),
 	)
 
 	ctx := cmd.Context()
-	iface := a2a.NewAgentInterface(opts.address, protocol)
-	client, err := a2aclient.NewFromEndpoints(ctx, []*a2a.AgentInterface{iface}, factoryOpts...)
+	var card *a2a.AgentCard
+	resolver := agentcard.Resolver{Client: httpClient, CardParser: a2av0.NewAgentCardParser()}
+	var resolveOpts []agentcard.ResolveOption
+	if bearerToken != "" {
+		resolveOpts = append(resolveOpts, agentcard.WithRequestHeader("Authorization", "Bearer "+bearerToken))
+	}
+	if resolved, resolveErr := resolver.Resolve(ctx, opts.address, resolveOpts...); resolveErr == nil && len(resolved.SupportedInterfaces) > 0 {
+		card = resolved
+		version := resolved.SupportedInterfaces[0].ProtocolVersion
+		card.SupportedInterfaces = []*a2a.AgentInterface{{
+			URL:             opts.address,
+			ProtocolBinding: protocol,
+			ProtocolVersion: version,
+		}}
+	}
+
+	var client *a2aclient.Client
+	if card != nil {
+		client, err = a2aclient.NewFromCard(ctx, card, factoryOpts...)
+	} else {
+		iface := a2a.NewAgentInterface(opts.address, protocol)
+		client, err = a2aclient.NewFromEndpoints(ctx, []*a2a.AgentInterface{iface}, factoryOpts...)
+	}
 	if err != nil {
 		return fmt.Errorf("connecting to %s: %w", opts.address, err)
 	}
@@ -272,6 +299,19 @@ func streamA2AMessage(cmd *cobra.Command, opts a2aSendOptions) error {
 	}
 
 	out := cmd.OutOrStdout()
+	if card != nil && !card.Capabilities.Streaming {
+		result, err := client.SendMessage(ctx, req)
+		if err != nil {
+			if hint := a2aUnauthorizedHint(logger.status, opts.withAuthorization); hint != "" {
+				fmt.Fprintln(cmd.ErrOrStderr(), hint)
+			}
+			return err
+		}
+		printA2AResult(out, result)
+		return nil
+	}
+
+	eventCount := 0
 	for event, err := range client.SendStreamingMessage(ctx, req) {
 		// The iterator reports a failed call by yielding an error; stop at
 		// the first one rather than continuing to print, since the stream
@@ -286,9 +326,22 @@ func streamA2AMessage(cmd *cobra.Command, opts a2aSendOptions) error {
 			}
 			return err
 		}
+		eventCount++
 		printA2AEvent(out, event)
 	}
+	if eventCount == 0 {
+		return fmt.Errorf("agent returned no A2A events")
+	}
 	return nil
+}
+
+func printA2AResult(out io.Writer, result a2a.SendMessageResult) {
+	printA2AEvent(out, result)
+	if task, ok := result.(*a2a.Task); ok {
+		for _, artifact := range task.Artifacts {
+			printA2AEvent(out, &a2a.TaskArtifactUpdateEvent{TaskID: task.ID, Artifact: artifact})
+		}
+	}
 }
 
 // printA2AEvent prints one streamed event as a single line.
