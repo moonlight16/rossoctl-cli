@@ -558,16 +558,24 @@ type EnvVar struct {
 	Value string `json:"value"`
 }
 
+// PersistentStorageConfig requests a PVC-backed workspace for workload types
+// that support persistent storage.
+type PersistentStorageConfig struct {
+	Enabled bool   `json:"enabled"`
+	Size    string `json:"size"`
+}
+
 // CreateAgentRequest is the subset of the backend's CreateAgentRequest that
 // the CLI populates. Fields the server defaults are omitted; only what we set
 // is sent. deploymentMethod selects image vs source; workloadType selects
 // deployment|statefulset|job|sandbox.
 type CreateAgentRequest struct {
-	Name             string   `json:"name"`
-	Namespace        string   `json:"namespace"`
-	DeploymentMethod string   `json:"deploymentMethod"`
-	WorkloadType     string   `json:"workloadType"`
-	EnvVars          []EnvVar `json:"envVars,omitempty"`
+	Name              string                   `json:"name"`
+	Namespace         string                   `json:"namespace"`
+	DeploymentMethod  string                   `json:"deploymentMethod"`
+	WorkloadType      string                   `json:"workloadType"`
+	EnvVars           []EnvVar                 `json:"envVars,omitempty"`
+	PersistentStorage *PersistentStorageConfig `json:"persistentStorage,omitempty"`
 
 	// Image deployment fields.
 	ContainerImage  string `json:"containerImage,omitempty"`

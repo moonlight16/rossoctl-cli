@@ -120,6 +120,38 @@ func TestAgentsImportFromImageDeploymentType(t *testing.T) {
 	}
 }
 
+func TestAgentsImportFromImagePersistentStorage(t *testing.T) {
+	isolateHome(t)
+	var body map[string]any
+	srv := newImportServer(t, &body)
+	setupImportContext(t, srv, "team1")
+
+	if _, err := execute(t, "agents", "import", "--deployment-type", "statefulset", "from-image",
+		"--name", "orders", "--containerImage", "img", "--storage-size", "5Gi"); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	storage, ok := body["persistentStorage"].(map[string]any)
+	if !ok {
+		t.Fatalf("persistentStorage = %#v, want object", body["persistentStorage"])
+	}
+	if storage["enabled"] != true || storage["size"] != "5Gi" {
+		t.Errorf("persistentStorage = %#v, want enabled 5Gi", storage)
+	}
+}
+
+func TestAgentsImportFromImageRejectsStorageForDeployment(t *testing.T) {
+	isolateHome(t)
+	var body map[string]any
+	srv := newImportServer(t, &body)
+	setupImportContext(t, srv, "team1")
+
+	_, err := execute(t, "agents", "import", "from-image",
+		"--name", "orders", "--containerImage", "img", "--storage-size", "5Gi")
+	if err == nil || !strings.Contains(err.Error(), "statefulset or sandbox") {
+		t.Fatalf("error = %v, want workload compatibility error", err)
+	}
+}
+
 func TestAgentsImportFromImageNamespaceOverride(t *testing.T) {
 	isolateHome(t)
 	var body map[string]any

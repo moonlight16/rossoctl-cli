@@ -51,6 +51,7 @@ func newAgentsImportFromImageCmd() *cobra.Command {
 		envVarFlags     []string
 		containerImage  string
 		imagePullSecret string
+		storageSize     string
 	)
 
 	cmd := &cobra.Command{
@@ -71,6 +72,9 @@ same variable, --envVar wins, whatever order the flags appear in.`,
 			}
 			if containerImage == "" {
 				return fmt.Errorf("--containerImage is required")
+			}
+			if storageSize != "" && importDeploymentType != "statefulset" && importDeploymentType != "sandbox" {
+				return fmt.Errorf("--storage-size requires --deployment-type statefulset or sandbox")
 			}
 
 			namespace, err := agentsNamespace()
@@ -94,7 +98,7 @@ same variable, --envVar wins, whatever order the flags appear in.`,
 			if err != nil {
 				return err
 			}
-			resp, err := client.CreateAgent(cmd.Context(), &apiclient.CreateAgentRequest{
+			request := &apiclient.CreateAgentRequest{
 				Name:             name,
 				Namespace:        namespace,
 				DeploymentMethod: "image",
@@ -103,7 +107,14 @@ same variable, --envVar wins, whatever order the flags appear in.`,
 				ImagePullSecret:  imagePullSecret,
 				EnvVars:          envVars,
 				CreateHTTPRoute:  importCreateHTTPRoute,
-			})
+			}
+			if storageSize != "" {
+				request.PersistentStorage = &apiclient.PersistentStorageConfig{
+					Enabled: true,
+					Size:    storageSize,
+				}
+			}
+			resp, err := client.CreateAgent(cmd.Context(), request)
 			if err != nil {
 				return err
 			}
@@ -133,6 +144,7 @@ same variable, --envVar wins, whatever order the flags appear in.`,
 		"environment variable as key=value (repeatable; wins over --envVarsURL for the same name)")
 	f.StringVar(&containerImage, "containerImage", "", "container image to deploy (required)")
 	f.StringVar(&imagePullSecret, "imagePullSecret", "", "name of the image pull secret")
+	f.StringVar(&storageSize, "storage-size", "", "enable persistent storage with this size (statefulset or sandbox, for example 5Gi)")
 
 	return cmd
 }
