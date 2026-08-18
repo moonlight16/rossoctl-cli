@@ -141,6 +141,45 @@ func TestAgentsImportFromImagePersistentStorage(t *testing.T) {
 	}
 }
 
+func TestAgentsImportFromImageContexts(t *testing.T) {
+	isolateHome(t)
+	var body map[string]any
+	srv := newImportServer(t, &body)
+	setupImportContext(t, srv, "team1")
+
+	if _, err := execute(t, "agents", "import", "--deployment-type", "sandbox",
+		"--context", "research:/workspace", "--context", "memory:/memory",
+		"from-image", "--name", "orders", "--containerImage", "img"); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	contexts, ok := body["contexts"].([]any)
+	if !ok || len(contexts) != 2 {
+		t.Fatalf("contexts = %#v, want two attachments", body["contexts"])
+	}
+	first := contexts[0].(map[string]any)
+	if first["name"] != "research" || first["mountPath"] != "/workspace" || first["readOnly"] != false {
+		t.Errorf("first context = %#v", first)
+	}
+}
+
+func TestAgentsImportFromImageRejectsInvalidContext(t *testing.T) {
+	for _, value := range []string{"research", "research:relative"} {
+		_, err := execute(t, "agents", "import", "--deployment-type", "sandbox", "--context", value, "from-image",
+			"--name", "orders", "--containerImage", "img")
+		if err == nil || !strings.Contains(err.Error(), "invalid --context") {
+			t.Errorf("--context %q error = %v, want validation error", value, err)
+		}
+	}
+}
+
+func TestAgentsImportFromImageRejectsContextForDeployment(t *testing.T) {
+	_, err := execute(t, "agents", "import", "--context", "research:/workspace", "from-image",
+		"--name", "orders", "--containerImage", "img")
+	if err == nil || !strings.Contains(err.Error(), "statefulset or sandbox") {
+		t.Fatalf("error = %v, want workload compatibility error", err)
+	}
+}
+
 func TestAgentsImportFromImageRejectsStorageForDeployment(t *testing.T) {
 	isolateHome(t)
 	var body map[string]any
