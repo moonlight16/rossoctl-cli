@@ -87,6 +87,33 @@ func TestContextsList(t *testing.T) {
 	}
 }
 
+func TestContextsListExplainsUnsupportedServer(t *testing.T) {
+	isolateHome(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/namespaces":
+			_, _ = w.Write([]byte(`{"namespaces":["team1"]}`))
+		case "/api/v1/contexts/team1":
+			http.Error(w, `{"detail":"Not Found"}`, http.StatusNotFound)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	setupImportContext(t, srv, "team1")
+
+	_, err := execute(t, "contexts", "list")
+	if err == nil {
+		t.Fatal("expected an unsupported-server error")
+	}
+	for _, expected := range []string{"does not support context infrastructure", "rossoctl/rossoctl#2392"} {
+		if !strings.Contains(err.Error(), expected) {
+			t.Errorf("error missing %q: %v", expected, err)
+		}
+	}
+}
+
 func TestContextAlias(t *testing.T) {
 	command, _, err := rootCmd.Find([]string{"context", "list"})
 	if err != nil {
@@ -130,6 +157,23 @@ func TestContextCreateHelpIncludesExamples(t *testing.T) {
 	} {
 		if !strings.Contains(out, expected) {
 			t.Errorf("create help missing %q:\n%s", expected, out)
+		}
+	}
+}
+
+func TestContextGroupHelpDefinesContextInfrastructure(t *testing.T) {
+	out, err := execute(t, "context", "--help")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"durable context infrastructure for agents",
+		"distinct from rossoctl configuration",
+		"LLM's finite context window",
+		"PVC-backed storage",
+	} {
+		if !strings.Contains(out, expected) {
+			t.Errorf("context help missing %q:\n%s", expected, out)
 		}
 	}
 }

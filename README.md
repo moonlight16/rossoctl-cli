@@ -29,6 +29,36 @@ rossoctl login
 rossoctl agents list
 ```
 
+## Agent context infrastructure
+
+`rossoctl context` manages durable files made available to agents. A context
+resource can represent a mutable workspace, durable memory, reusable knowledge,
+or produced artifacts. Today all four types use PVC-backed storage mounted into
+StatefulSet or Sandbox agents.
+
+This meaning is separate from both:
+
+- the kubectl-style connection contexts managed by `rossoctl config`; and
+- an LLM's finite context window.
+
+```sh
+# Create and inspect a shared workspace.
+rossoctl context create research --shared --size 10Gi \
+    --storage-class ibm-scale-csi
+rossoctl context list
+
+# Mount it when importing an agent.
+rossoctl agents import --deployment-type sandbox \
+    --context research:/workspace \
+    from-image --name researcher --containerImage IMAGE
+```
+
+Context commands require a Rosso server containing the context resource API
+introduced by [rossoctl/rossoctl#2392](https://github.com/rossoctl/rossoctl/pull/2392).
+An older server returns an actionable compatibility error from `context list`.
+See [Context infrastructure](docs/context-infrastructure.md) for the model,
+lifecycle, storage behavior, and additional examples.
+
 ## Running a command behind an AuthBridge pipeline
 
 Rossoctl can be used to test how an agent runs under an AuthBridge configuration on your laptop.  It provides an in-process implementation of AuthBridge.

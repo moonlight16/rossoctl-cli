@@ -2,7 +2,9 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -11,6 +13,14 @@ import (
 )
 
 var contextsNamespace string
+
+func contextListError(err error) error {
+	var statusErr *apiclient.StatusError
+	if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("this Rosso server does not support context infrastructure; context commands require the context resource API introduced by rossoctl/rossoctl#2392: %w", err)
+	}
+	return err
+}
 
 func contextNamespace() (string, error) {
 	if contextsNamespace != "" {
@@ -128,7 +138,7 @@ func newContextsListCmd() *cobra.Command {
 			}
 			result, err := client.ListContexts(cmd.Context(), namespace)
 			if err != nil {
-				return err
+				return contextListError(err)
 			}
 			if jsonOutput {
 				encoded, err := json.MarshalIndent(result.Items, "", "  ")
@@ -194,8 +204,14 @@ func printContextResource(cmd *cobra.Command, value *apiclient.ContextResource, 
 }
 
 func init() {
-	contextsCmd := newGroup("contexts", "Manage named agent context resources")
+	contextsCmd := newGroup("contexts", "Manage durable context infrastructure for agents")
 	contextsCmd.Aliases = []string{"context"}
+	contextsCmd.Long = `Manage durable context infrastructure for agents.
+
+Context resources make files available to agents as workspaces, memory,
+knowledge, or artifacts. They are distinct from rossoctl configuration
+contexts and from an LLM's finite context window. The current backend is
+PVC-backed storage mounted into StatefulSet or Sandbox agents.`
 	contextsCmd.PersistentFlags().StringVar(&contextsNamespace, "namespace", "", "namespace (overrides current context)")
 	contextsCmd.AddCommand(newContextsCreateCmd(), newContextsListCmd(), newContextsGetCmd(), newContextsDeleteCmd())
 	rootCmd.AddCommand(contextsCmd)
