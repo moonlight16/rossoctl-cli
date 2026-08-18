@@ -211,7 +211,10 @@ func init() {
 Context resources make files available to agents as workspaces, memory,
 knowledge, or artifacts. They are distinct from rossoctl configuration
 contexts and from an LLM's finite context window. The current backend is
-PVC-backed storage mounted into StatefulSet or Sandbox agents.`
+PVC-backed storage mounted into StatefulSet or Sandbox agents.
+
+Learn more:
+https://github.com/rossoctl/rossoctl/blob/main/docs/concepts/context-service.md`
 	contextsCmd.PersistentFlags().StringVar(&contextsNamespace, "namespace", "", "namespace (overrides current context)")
 	contextsCmd.AddCommand(newContextsCreateCmd(), newContextsListCmd(), newContextsGetCmd(), newContextsDeleteCmd())
 	rootCmd.AddCommand(contextsCmd)
