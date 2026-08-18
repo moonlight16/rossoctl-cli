@@ -13,6 +13,12 @@ ships prebuilt binaries built by `.github/workflows/release.yml`; the asset
 names are `rossoctl-<version>-<uname>-<uname -m>.tar.gz` (arm64 is labeled
 `arm64` on both Linux and Darwin).
 
+## Feature documentation
+
+- [Context infrastructure](context-infrastructure.md) explains named agent
+  context resources, their relationship to storage, and how they differ from
+  rossoctl configuration contexts and LLM context windows.
+
 ## Layout
 
 This project follows the standard Go CLI layout:
@@ -136,4 +142,3 @@ assert on the command strings they would run rather than invoking a real runtime
 to `main`, plus a `go mod tidy` check. Shuffled order is included because the
 suite mutates process state (`HOME`, cobra flag values), so an order-dependent
 test is a real risk — see the pflag hazard documented in `cmd/root_test.go`.
-
