@@ -13,12 +13,6 @@ ships prebuilt binaries built by `.github/workflows/release.yml`; the asset
 names are `rossoctl-<version>-<uname>-<uname -m>.tar.gz` (arm64 is labeled
 `arm64` on both Linux and Darwin).
 
-## Feature documentation
-
-- [Context infrastructure](context-infrastructure.md) explains named agent
-  context resources, their relationship to storage, and how they differ from
-  rossoctl configuration contexts and LLM context windows.
-
 ## Layout
 
 This project follows the standard Go CLI layout:

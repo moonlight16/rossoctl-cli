@@ -171,6 +171,7 @@ func TestContextGroupHelpDefinesContextInfrastructure(t *testing.T) {
 		"distinct from rossoctl configuration",
 		"LLM's finite context window",
 		"PVC-backed storage",
+		"docs/concepts/context-service.md",
 	} {
 		if !strings.Contains(out, expected) {
 			t.Errorf("context help missing %q:\n%s", expected, out)

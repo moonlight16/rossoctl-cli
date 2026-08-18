@@ -31,15 +31,12 @@ rossoctl agents list
 
 ## Agent context infrastructure
 
-`rossoctl context` manages durable files made available to agents. A context
-resource can represent a mutable workspace, durable memory, reusable knowledge,
-or produced artifacts. Today all four types use PVC-backed storage mounted into
-StatefulSet or Sandbox agents.
-
-This meaning is separate from both:
-
-- the kubectl-style connection contexts managed by `rossoctl config`; and
-- an LLM's finite context window.
+`rossoctl context` creates, lists, and attaches the context resources provided
+by Rosso's optional Context Service integration. See Rosso's canonical
+[Context Service documentation](https://github.com/rossoctl/rossoctl/blob/main/docs/concepts/context-service.md)
+for the resource model, storage behavior, and lifecycle. The underlying service
+is maintained in the
+[context-service repository](https://github.com/rossoctl/context-service).
 
 ```sh
 # Create and inspect a shared workspace.
@@ -56,8 +53,15 @@ rossoctl agents import --deployment-type sandbox \
 Context commands require a Rosso server containing the context resource API
 introduced by [rossoctl/rossoctl#2392](https://github.com/rossoctl/rossoctl/pull/2392).
 An older server returns an actionable compatibility error from `context list`.
-See [Context infrastructure](docs/context-infrastructure.md) for the model,
-lifecycle, storage behavior, and additional examples.
+
+To try the commands from the latest source:
+
+```sh
+git clone https://github.com/rossoctl/rossoctl-cli.git
+cd rossoctl-cli
+make build
+./bin/rossoctl context --help
+```
 
 ## Running a command behind an AuthBridge pipeline
 
