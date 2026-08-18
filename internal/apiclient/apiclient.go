@@ -226,6 +226,9 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte, 
 		}
 		return &StatusError{Endpoint: endpoint, StatusCode: resp.StatusCode, Body: msg}
 	}
+	if out == nil {
+		return nil
+	}
 
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
 		return fmt.Errorf("decoding response from %s: %w", endpoint, err)
@@ -605,6 +608,12 @@ func marshalWithAdditional(req any, additional map[string]any) ([]byte, error) {
 	return json.Marshal(merged)
 }
 
+type ContextAttachment struct {
+	Name      string `json:"name"`
+	MountPath string `json:"mountPath"`
+	ReadOnly  bool   `json:"readOnly"`
+}
+
 // CreateAgentRequest is the subset of the backend's CreateAgentRequest that
 // the CLI populates. Fields the server defaults are omitted; only what we set
 // is sent. deploymentMethod selects image vs source; workloadType selects
@@ -616,6 +625,7 @@ type CreateAgentRequest struct {
 	WorkloadType      string                   `json:"workloadType"`
 	EnvVars           []EnvVar                 `json:"envVars,omitempty"`
 	PersistentStorage *PersistentStorageConfig `json:"persistentStorage,omitempty"`
+	Contexts          []ContextAttachment      `json:"contexts,omitempty"`
 
 	// Image deployment fields.
 	ContainerImage  string `json:"containerImage,omitempty"`
@@ -660,6 +670,67 @@ type CreateAgentRequest struct {
 func (r CreateAgentRequest) MarshalJSON() ([]byte, error) {
 	type plain CreateAgentRequest
 	return marshalWithAdditional(plain(r), r.AdditionalParameters)
+}
+
+type ContextStorage struct {
+	Backend      string `json:"backend"`
+	Size         string `json:"size"`
+	AccessMode   string `json:"accessMode"`
+	StorageClass string `json:"storageClass,omitempty"`
+}
+
+type CreateContextRequest struct {
+	Name      string         `json:"name"`
+	Namespace string         `json:"namespace"`
+	Type      string         `json:"type"`
+	Storage   ContextStorage `json:"storage"`
+}
+
+type ContextResource struct {
+	Name       string         `json:"name"`
+	Namespace  string         `json:"namespace"`
+	Type       string         `json:"type"`
+	Status     string         `json:"status"`
+	Storage    ContextStorage `json:"storage"`
+	Attachment struct {
+		Kind      string `json:"kind"`
+		ClaimName string `json:"claimName"`
+	} `json:"attachment"`
+}
+
+type ContextListResponse struct {
+	Items []ContextResource `json:"items"`
+}
+
+func (c *Client) CreateContext(ctx context.Context, req *CreateContextRequest) (*ContextResource, error) {
+	var resp ContextResource
+	if err := c.postJSON(ctx, "contexts", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+func (c *Client) ListContexts(ctx context.Context, namespace string) (*ContextListResponse, error) {
+	var resp ContextListResponse
+	path := "contexts/" + url.PathEscape(namespace)
+	if err := c.getJSON(ctx, path, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+func (c *Client) GetContext(ctx context.Context, namespace, name string) (*ContextResource, error) {
+	var resp ContextResource
+	path := "contexts/" + url.PathEscape(namespace) + "/" + url.PathEscape(name)
+	if err := c.getJSON(ctx, path, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+func (c *Client) DeleteContext(ctx context.Context, namespace, name string) error {
+	path := "contexts/" + url.PathEscape(namespace) + "/" + url.PathEscape(name)
+	return c.deleteJSON(ctx, path, nil)
 }
 
 // CreateAgentResponse mirrors the backend's CreateAgentResponse model.

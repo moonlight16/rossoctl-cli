@@ -65,6 +65,18 @@ type Rossoctl interface {
 	// CreateAgent creates an agent from the given request.
 	CreateAgent(ctx context.Context, req *apiclient.CreateAgentRequest) (*apiclient.CreateAgentResponse, error)
 
+	// CreateContext creates a named agent context resource.
+	CreateContext(ctx context.Context, req *apiclient.CreateContextRequest) (*apiclient.ContextResource, error)
+
+	// ListContexts lists context resources in a namespace.
+	ListContexts(ctx context.Context, namespace string) (*apiclient.ContextListResponse, error)
+
+	// GetContext fetches a named context resource in a namespace.
+	GetContext(ctx context.Context, namespace, name string) (*apiclient.ContextResource, error)
+
+	// DeleteContext deletes a named context resource in a namespace.
+	DeleteContext(ctx context.Context, namespace, name string) error
+
 	// ListTools lists tools in the given namespace (empty => server default).
 	ListTools(ctx context.Context, namespace string) (*apiclient.ToolListResponse, error)
 

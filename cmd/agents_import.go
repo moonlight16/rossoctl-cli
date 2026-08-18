@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -36,6 +37,10 @@ var importCreateHTTPRoute bool
 // split or reject outright, and a non-nil slice default leaks between tests.
 var importAdditionalParameterJSON []string
 
+// importContextFlags contains named Context Service resources to mount into
+// the agent. Each value has the form NAME:MOUNT_PATH.
+var importContextFlags []string
+
 // newAgentsImportCmd builds the `agents import` command and its two
 // subcommands, `from-image` and `from-source`.
 //
@@ -51,6 +56,8 @@ func newAgentsImportCmd() *cobra.Command {
 		"create an HTTPRoute exposing the agent")
 	importCmd.PersistentFlags().StringArrayVar(&importAdditionalParameterJSON, additionalParameterFlagName, nil,
 		"JSON dict, or a file containing one, merged into the request body (repeatable; later values and these keys win)")
+	importCmd.PersistentFlags().StringArrayVar(&importContextFlags, "context", nil,
+		"named context and absolute mount path as NAME:MOUNT_PATH (repeatable)")
 
 	importCmd.AddCommand(
 		newAgentsImportFromImageCmd(),
@@ -97,6 +104,13 @@ the flags above already set replaces it.`,
 			if storageSize != "" && importDeploymentType != "statefulset" && importDeploymentType != "sandbox" {
 				return fmt.Errorf("--storage-size requires --deployment-type statefulset or sandbox")
 			}
+			contexts, err := parseContextFlags(importContextFlags)
+			if err != nil {
+				return err
+			}
+			if len(contexts) > 0 && importDeploymentType != "statefulset" && importDeploymentType != "sandbox" {
+				return fmt.Errorf("--context requires --deployment-type statefulset or sandbox")
+			}
 
 			namespace, err := agentsNamespace()
 			if err != nil {
@@ -135,6 +149,7 @@ the flags above already set replaces it.`,
 				ImagePullSecret:  imagePullSecret,
 				EnvVars:          envVars,
 				CreateHTTPRoute:  importCreateHTTPRoute,
+				Contexts:         contexts,
 
 				// Set last, but applied last as well: the overlay happens when the
 				// request is marshaled, so it wins over every field above — including
@@ -180,6 +195,31 @@ the flags above already set replaces it.`,
 	f.StringVar(&storageSize, "storage-size", "", "enable persistent storage with this size (statefulset or sandbox, for example 5Gi)")
 
 	return cmd
+}
+
+func parseContextFlags(values []string) ([]apiclient.ContextAttachment, error) {
+	attachments := make([]apiclient.ContextAttachment, 0, len(values))
+	seenPaths := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		name, mountPath, ok := strings.Cut(value, ":")
+		if !ok || strings.TrimSpace(name) == "" || strings.TrimSpace(mountPath) == "" {
+			return nil, fmt.Errorf("invalid --context %q: expected NAME:MOUNT_PATH", value)
+		}
+		name = strings.TrimSpace(name)
+		mountPath = strings.TrimSpace(mountPath)
+		if !strings.HasPrefix(mountPath, "/") {
+			return nil, fmt.Errorf("invalid --context %q: mount path must be absolute", value)
+		}
+		if _, exists := seenPaths[mountPath]; exists {
+			return nil, fmt.Errorf("invalid --context %q: mount path %q is already used", value, mountPath)
+		}
+		seenPaths[mountPath] = struct{}{}
+		attachments = append(attachments, apiclient.ContextAttachment{
+			Name:      name,
+			MountPath: mountPath,
+		})
+	}
+	return attachments, nil
 }
 
 func newAgentsImportFromSourceCmd() *cobra.Command {

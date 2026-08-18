@@ -826,3 +826,18 @@ func TestCreateAgentSendsAdditionalParameters(t *testing.T) {
 		t.Errorf("containerImage = %v, want the overlay to win on the wire", gotBody["containerImage"])
 	}
 }
+
+func TestDeleteContextAcceptsEmptyResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/api/v1/contexts/team1/research" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	c := &Client{BaseURL: srv.URL + "/api/v1/"}
+	if err := c.DeleteContext(context.Background(), "team1", "research"); err != nil {
+		t.Fatalf("DeleteContext: %v", err)
+	}
+}
